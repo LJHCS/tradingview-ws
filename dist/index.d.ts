@@ -20,7 +20,7 @@ interface TradingviewEvent {
     name: string;
     params: any[];
 }
-declare type TradingviewTimeframe = number | '1D' | '1W' | '1M' | '1Y';
+declare type TradingviewTimeframe = number | '1D' | '1W' | '1M' | '12M';
 export declare function connect(options?: ConnectionOptions): Promise<TradingviewConnection>;
 interface GetCandlesParams {
     connection: TradingviewConnection;

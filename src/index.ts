@@ -43,7 +43,7 @@ interface TradingviewEvent {
   params: any[]
 }
 
-type TradingviewTimeframe = number | '1D' | '1W' | '1M' | '1Y'
+type TradingviewTimeframe = number | '1D' | '1W' | '1M' | '12M'
 
 function parseMessage(message: string): MessagePayload[] {
   if (message.length === 0) return []
