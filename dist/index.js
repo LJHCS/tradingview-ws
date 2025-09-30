@@ -32,12 +32,6 @@ function parseMessage(message) {
         return { type: 'event', data: parsed };
     });
 }
-// 1Y 처리용 헬퍼
-function getSeriesTimeframe(tf) {
-    if (tf === '1Y')
-        return '1'; // TradingView에서 연 단위 시리즈는 1
-    return tf.toString();
-}
 function connect(options = {}) {
     return __awaiter(this, void 0, void 0, function* () {
         let token = 'unauthorized_user_token';
@@ -114,20 +108,24 @@ function getCandles({ connection, symbols, amount, timeframe = 60 }) {
             let symbol = symbols[currentSymIndex];
             let currentSymCandles = [];
             const unsubscribe = connection.subscribe(event => {
+                // received new candles
                 if (event.name === 'timescale_update') {
                     let newCandles = event.params[1]['sds_1']['s'];
                     if (newCandles.length > batchSize) {
+                        // sometimes tradingview sends already received candles
                         newCandles = newCandles.slice(0, -currentSymCandles.length);
                     }
                     currentSymCandles = newCandles.concat(currentSymCandles);
                     return;
                 }
+                // loaded all requested candles
                 if (['series_completed', 'symbol_error'].includes(event.name)) {
                     const loadedCount = currentSymCandles.length;
                     if (loadedCount > 0 && loadedCount % batchSize === 0 && (!amount || loadedCount < amount)) {
                         connection.send('request_more_data', [chartSession, 'sds_1', batchSize]);
                         return;
                     }
+                    // loaded all candles for current symbol
                     if (amount)
                         currentSymCandles = currentSymCandles.slice(0, amount);
                     const candles = currentSymCandles.map(c => ({
@@ -139,6 +137,7 @@ function getCandles({ connection, symbols, amount, timeframe = 60 }) {
                         volume: c.v[5]
                     }));
                     allCandles.push(candles);
+                    // next symbol
                     if (symbols.length - 1 > currentSymIndex) {
                         currentSymCandles = [];
                         currentSymIndex += 1;
@@ -153,11 +152,12 @@ function getCandles({ connection, symbols, amount, timeframe = 60 }) {
                             'sds_1',
                             `s${currentSymIndex}`,
                             `sds_sym_${currentSymIndex}`,
-                            getSeriesTimeframe(timeframe),
+                            timeframe.toString(),
                             ''
                         ]);
                         return;
                     }
+                    // all symbols loaded
                     unsubscribe();
                     resolve(allCandles);
                 }
@@ -169,13 +169,7 @@ function getCandles({ connection, symbols, amount, timeframe = 60 }) {
                 '=' + JSON.stringify({ symbol, adjustment: 'splits' })
             ]);
             connection.send('create_series', [
-                chartSession,
-                'sds_1',
-                's0',
-                'sds_sym_0',
-                getSeriesTimeframe(timeframe),
-                batchSize,
-                ''
+                chartSession, 'sds_1', 's0', 'sds_sym_0', timeframe.toString(), batchSize, ''
             ]);
         });
     });
