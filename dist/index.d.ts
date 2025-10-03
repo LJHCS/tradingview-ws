@@ -28,6 +28,16 @@ interface GetCandlesParams {
     amount?: number;
     timeframe?: TradingviewTimeframe;
 }
+/**
+ * 기존 함수 - candles만 반환
+ */
 export declare function getCandles({ connection, symbols, amount, timeframe }: GetCandlesParams): Promise<Candle[][]>;
+/**
+ * 새 함수 - candles + chartSession 반환
+ */
+export declare function getCandlesWithSession({ connection, symbols, amount, timeframe }: GetCandlesParams): Promise<{
+    candles: Candle[][];
+    chartSession: string;
+}>;
 export {};
 //# sourceMappingURL=index.d.ts.map

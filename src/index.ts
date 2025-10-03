@@ -137,10 +137,13 @@ export async function connect(options: ConnectionOptions = {}): Promise<Tradingv
 interface GetCandlesParams {
   connection: TradingviewConnection,
   symbols: string[],
-  amount?: number
+  amount?: number,
   timeframe?: TradingviewTimeframe
 }
 
+/**
+ * 기존 함수 - candles만 반환
+ */
 export async function getCandles({ connection, symbols, amount, timeframe = 60 }: GetCandlesParams) {
   if (symbols.length === 0) return []
 
@@ -154,26 +157,21 @@ export async function getCandles({ connection, symbols, amount, timeframe = 60 }
     let currentSymCandles: RawCandle[] = []
 
     const unsubscribe = connection.subscribe(event => {
-      // received new candles
       if (event.name === 'timescale_update') {
         let newCandles: RawCandle[] = event.params[1]['sds_1']['s']
         if (newCandles.length > batchSize) {
-          // sometimes tradingview sends already received candles
           newCandles = newCandles.slice(0, -currentSymCandles.length)
         }
         currentSymCandles = newCandles.concat(currentSymCandles)
         return
       }
 
-      // loaded all requested candles
       if (['series_completed', 'symbol_error'].includes(event.name)) {
         const loadedCount = currentSymCandles.length
         if (loadedCount > 0 && loadedCount % batchSize === 0 && (!amount || loadedCount < amount)) {
           connection.send('request_more_data', [chartSession, 'sds_1', batchSize])
           return
         }
-
-        // loaded all candles for current symbol
 
         if (amount) currentSymCandles = currentSymCandles.slice(0, amount)
 
@@ -187,7 +185,6 @@ export async function getCandles({ connection, symbols, amount, timeframe = 60 }
         }))
         allCandles.push(candles)
 
-        // next symbol
         if (symbols.length - 1 > currentSymIndex) {
           currentSymCandles = []
           currentSymIndex += 1
@@ -209,9 +206,90 @@ export async function getCandles({ connection, symbols, amount, timeframe = 60 }
           return
         }
 
-        // all symbols loaded
         unsubscribe()
         resolve(allCandles)
+      }
+    })
+
+    connection.send('chart_create_session', [chartSession, ''])
+    connection.send('resolve_symbol', [
+      chartSession,
+      `sds_sym_0`,
+      '=' + JSON.stringify({ symbol, adjustment: 'splits' })
+    ])
+    connection.send('create_series', [
+      chartSession, 'sds_1', 's0', 'sds_sym_0', timeframe.toString(), batchSize, ''
+    ])
+  })
+}
+
+/**
+ * 새 함수 - candles + chartSession 반환
+ */
+export async function getCandlesWithSession({ connection, symbols, amount, timeframe = 60 }: GetCandlesParams) {
+  if (symbols.length === 0) return { candles: [], chartSession: "" }
+
+  const chartSession = "cs_" + randomstring.generate(12)
+  const batchSize = amount && amount < MAX_BATCH_SIZE ? amount : MAX_BATCH_SIZE
+
+  return new Promise<{ candles: Candle[][], chartSession: string }>(resolve => {
+    const allCandles: Candle[][] = []
+    let currentSymIndex = 0
+    let symbol = symbols[currentSymIndex]
+    let currentSymCandles: RawCandle[] = []
+
+    const unsubscribe = connection.subscribe(event => {
+      if (event.name === 'timescale_update') {
+        let newCandles: RawCandle[] = event.params[1]['sds_1']['s']
+        if (newCandles.length > batchSize) {
+          newCandles = newCandles.slice(0, -currentSymCandles.length)
+        }
+        currentSymCandles = newCandles.concat(currentSymCandles)
+        return
+      }
+
+      if (['series_completed', 'symbol_error'].includes(event.name)) {
+        const loadedCount = currentSymCandles.length
+        if (loadedCount > 0 && loadedCount % batchSize === 0 && (!amount || loadedCount < amount)) {
+          connection.send('request_more_data', [chartSession, 'sds_1', batchSize])
+          return
+        }
+
+        if (amount) currentSymCandles = currentSymCandles.slice(0, amount)
+
+        const candles = currentSymCandles.map(c => ({
+          timestamp: c.v[0],
+          open: c.v[1],
+          high: c.v[2],
+          low: c.v[3],
+          close: c.v[4],
+          volume: c.v[5]
+        }))
+        allCandles.push(candles)
+
+        if (symbols.length - 1 > currentSymIndex) {
+          currentSymCandles = []
+          currentSymIndex += 1
+          symbol = symbols[currentSymIndex]
+          connection.send('resolve_symbol', [
+            chartSession,
+            `sds_sym_${currentSymIndex}`,
+            '=' + JSON.stringify({ symbol, adjustment: 'splits' })
+          ])
+
+          connection.send('modify_series', [
+            chartSession,
+            'sds_1',
+            `s${currentSymIndex}`,
+            `sds_sym_${currentSymIndex}`,
+            timeframe.toString(),
+            ''
+          ])
+          return
+        }
+
+        unsubscribe()
+        resolve({ candles: allCandles, chartSession })
       }
     })
 
