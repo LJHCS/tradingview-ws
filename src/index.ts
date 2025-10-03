@@ -2,305 +2,154 @@ import axios from 'axios'
 import WebSocket from 'ws'
 import randomstring from "randomstring"
 
-const MAX_BATCH_SIZE = 5000 // found experimentally
+const MAX_BATCH_SIZE = 5000 // 경험적으로 찾은 최대 배치
 
-type Subscriber = (event: TradingviewEvent) => void
-type Unsubscriber = () => void
+// --- 타입 정의 ---
+export type Subscriber = (event: TradingviewEvent) => void
+export type Unsubscriber = () => void
+export type TradingviewTimeframe = number | '1D' | '1W' | '1M' | '12M'
 
-type MessageType = 'ping' | 'session' | 'event'
-
-interface RawCandle {
-  i: number
-  v: number[]
-}
-
-export interface Candle {
-  timestamp: number
-  high: number
-  low: number
-  open: number
-  close: number
-  volume: number
-}
-
-interface MessagePayload {
-  type: MessageType
-  data: any
-}
-
-interface TradingviewConnection {
+export interface TradingviewEvent { name: string, params: any[] }
+export interface TradingviewConnection {
   subscribe: (handler: Subscriber) => Unsubscriber
   send: (name: string, params: any[]) => void
   close: () => Promise<void>
 }
+export interface Candle { timestamp: number, open: number, high: number, low: number, close: number, volume: number }
+interface RawCandle { i: number, v: number[] }
+interface ConnectionOptions { sessionId?: string }
 
-interface ConnectionOptions {
-  sessionId?: string
-}
-
-interface TradingviewEvent {
-  name: string,
-  params: any[]
-}
-
-type TradingviewTimeframe = number | '1D' | '1W' | '1M' | '12M'
-
-function parseMessage(message: string): MessagePayload[] {
-  if (message.length === 0) return []
-
+// --- 메시지 파싱 ---
+function parseMessage(message: string) {
+  if (!message) return []
   const events = message.toString().split(/~m~\d+~m~/).slice(1)
-
   return events.map(event => {
-    if (event.substring(0, 3) === "~h~") {
-      return { type: 'ping', data: `~m~${event.length}~m~${event}` }
-    }
-
+    if (event.substring(0, 3) === "~h~") return { type: 'ping', data: `~m~${event.length}~m~${event}` }
     const parsed = JSON.parse(event)
-
-    if (parsed['session_id']) {
-      return { type: 'session', data: parsed }
-    }
-
+    if (parsed['session_id']) return { type: 'session', data: parsed }
     return { type: 'event', data: parsed }
   })
 }
 
+// --- 서버 연결 ---
 export async function connect(options: ConnectionOptions = {}): Promise<TradingviewConnection> {
   let token = 'unauthorized_user_token'
-
   if (options.sessionId) {
-    const resp = await axios({
-      method: 'get',
-      url: 'https://www.tradingview.com/disclaimer/',
+    const resp = await axios.get('https://www.tradingview.com/disclaimer/', {
       headers: { "Cookie": `sessionid=${options.sessionId}` }
     })
     token = resp.data.match(/"auth_token":"(.+?)"/)[1]
   }
 
-  const connection = new WebSocket("wss://prodata.tradingview.com/socket.io/websocket", {
-    origin: "https://prodata.tradingview.com"
-  })
-
+  const ws = new WebSocket("wss://prodata.tradingview.com/socket.io/websocket", { origin: "https://prodata.tradingview.com" })
   const subscribers: Set<Subscriber> = new Set()
 
-  function subscribe(handler: Subscriber): Unsubscriber {
+  const subscribe = (handler: Subscriber) => {
     subscribers.add(handler)
-    return () => {
-      subscribers.delete(handler)
-    }
+    return () => subscribers.delete(handler)
   }
-
-  function send(name: string, params: any[]) {
+  const send = (name: string, params: any[]) => {
     const data = JSON.stringify({ m: name, p: params })
-    const message = "~m~" + data.length + "~m~" + data
-    connection.send(message)
+    ws.send("~m~" + data.length + "~m~" + data)
   }
+  const close = async () => new Promise<void>((res, rej) => { ws.on('close', res); ws.on('error', rej); ws.close() })
 
-  async function close() {
-    return new Promise<void>((resolve, reject) => {
-      connection.on('close', resolve)
-      connection.on('error', reject)
-      connection.close()
-    })
-  }
-
-  return new Promise<TradingviewConnection>((resolve, reject) => {
-    connection.on('error', error => reject(error))
-
-    connection.on('message', message => {
+  return new Promise((resolve, reject) => {
+    ws.on('error', reject)
+    ws.on('message', message => {
       const payloads = parseMessage(message.toString())
-
       for (const payload of payloads) {
         switch (payload.type) {
-          case 'ping':
-            connection.send(payload.data)
-            break;
-          case 'session':
-            send('set_auth_token', [token])
-            resolve({ subscribe, send, close })
-            break;
+          case 'ping': ws.send(payload.data); break;
+          case 'session': send('set_auth_token', [token]); resolve({ subscribe, send, close }); break;
           case 'event':
-            const event = {
-              name: payload.data.m,
-              params: payload.data.p
-            }
-            subscribers.forEach(handler => handler(event))
+            subscribers.forEach(h => h({ name: payload.data.m, params: payload.data.p }))
             break;
-          default:
-            throw new Error(`unknown payload: ${payload}`)
         }
       }
     })
   })
 }
 
-interface GetCandlesParams {
-  connection: TradingviewConnection,
-  symbols: string[],
-  amount?: number,
-  timeframe?: TradingviewTimeframe
-}
+// --- 캔들 가져오기 ---
+interface GetCandlesParams { connection: TradingviewConnection, symbols: string[], amount?: number, timeframe?: TradingviewTimeframe }
 
-/**
- * 기존 함수 - candles만 반환
- */
 export async function getCandles({ connection, symbols, amount, timeframe = 60 }: GetCandlesParams) {
-  if (symbols.length === 0) return []
-
+  if (!symbols.length) return []
   const chartSession = "cs_" + randomstring.generate(12)
   const batchSize = amount && amount < MAX_BATCH_SIZE ? amount : MAX_BATCH_SIZE
 
   return new Promise<Candle[][]>(resolve => {
     const allCandles: Candle[][] = []
-    let currentSymIndex = 0
-    let symbol = symbols[currentSymIndex]
-    let currentSymCandles: RawCandle[] = []
+    let idx = 0, symbol = symbols[idx], currentCandles: RawCandle[] = []
 
     const unsubscribe = connection.subscribe(event => {
       if (event.name === 'timescale_update') {
         let newCandles: RawCandle[] = event.params[1]['sds_1']['s']
-        if (newCandles.length > batchSize) {
-          newCandles = newCandles.slice(0, -currentSymCandles.length)
-        }
-        currentSymCandles = newCandles.concat(currentSymCandles)
+        if (newCandles.length > batchSize) newCandles = newCandles.slice(0, -currentCandles.length)
+        currentCandles = newCandles.concat(currentCandles)
         return
       }
 
       if (['series_completed', 'symbol_error'].includes(event.name)) {
-        const loadedCount = currentSymCandles.length
-        if (loadedCount > 0 && loadedCount % batchSize === 0 && (!amount || loadedCount < amount)) {
-          connection.send('request_more_data', [chartSession, 'sds_1', batchSize])
-          return
-        }
-
-        if (amount) currentSymCandles = currentSymCandles.slice(0, amount)
-
-        const candles = currentSymCandles.map(c => ({
-          timestamp: c.v[0],
-          open: c.v[1],
-          high: c.v[2],
-          low: c.v[3],
-          close: c.v[4],
-          volume: c.v[5]
+        if (amount) currentCandles = currentCandles.slice(0, amount)
+        const candles = currentCandles.map(c => ({
+          timestamp: c.v[0], open: c.v[1], high: c.v[2], low: c.v[3], close: c.v[4], volume: c.v[5]
         }))
         allCandles.push(candles)
 
-        if (symbols.length - 1 > currentSymIndex) {
-          currentSymCandles = []
-          currentSymIndex += 1
-          symbol = symbols[currentSymIndex]
-          connection.send('resolve_symbol', [
-            chartSession,
-            `sds_sym_${currentSymIndex}`,
-            '=' + JSON.stringify({ symbol, adjustment: 'splits' })
-          ])
-
-          connection.send('modify_series', [
-            chartSession,
-            'sds_1',
-            `s${currentSymIndex}`,
-            `sds_sym_${currentSymIndex}`,
-            timeframe.toString(),
-            ''
-          ])
+        if (idx + 1 < symbols.length) {
+          idx++; symbol = symbols[idx]; currentCandles = []
+          connection.send('resolve_symbol', [chartSession, `sds_sym_${idx}`, '=' + JSON.stringify({ symbol, adjustment: 'splits' })])
+          connection.send('modify_series', [chartSession, 'sds_1', `s${idx}`, `sds_sym_${idx}`, timeframe.toString(), ''])
           return
         }
 
-        unsubscribe()
-        resolve(allCandles)
+        unsubscribe(); resolve(allCandles)
       }
     })
 
     connection.send('chart_create_session', [chartSession, ''])
-    connection.send('resolve_symbol', [
-      chartSession,
-      `sds_sym_0`,
-      '=' + JSON.stringify({ symbol, adjustment: 'splits' })
-    ])
-    connection.send('create_series', [
-      chartSession, 'sds_1', 's0', 'sds_sym_0', timeframe.toString(), batchSize, ''
-    ])
+    connection.send('resolve_symbol', [chartSession, `sds_sym_0`, '=' + JSON.stringify({ symbol, adjustment: 'splits' })])
+    connection.send('create_series', [chartSession, 'sds_1', 's0', 'sds_sym_0', timeframe.toString(), batchSize, ''])
   })
 }
 
-/**
- * 새 함수 - candles + chartSession 반환
- */
-export async function getCandlesWithSession({ connection, symbols, amount, timeframe = 60 }: GetCandlesParams) {
-  if (symbols.length === 0) return { candles: [], chartSession: "" }
-
+// --- 보조지표 가져오기 ---
+export async function getIndicator({ connection, symbols, amount, timeframe = 60 }: GetCandlesParams) {
+  if (!symbols.length) return []
   const chartSession = "cs_" + randomstring.generate(12)
   const batchSize = amount && amount < MAX_BATCH_SIZE ? amount : MAX_BATCH_SIZE
 
-  return new Promise<{ candles: Candle[][], chartSession: string }>(resolve => {
-    const allCandles: Candle[][] = []
-    let currentSymIndex = 0
-    let symbol = symbols[currentSymIndex]
-    let currentSymCandles: RawCandle[] = []
+  return new Promise<any[][]>(resolve => {
+    const allIndicators: any[][] = []
+    let idx = 0, symbol = symbols[idx], currentIndicators: any[] = []
 
     const unsubscribe = connection.subscribe(event => {
-      if (event.name === 'timescale_update') {
-        let newCandles: RawCandle[] = event.params[1]['sds_1']['s']
-        if (newCandles.length > batchSize) {
-          newCandles = newCandles.slice(0, -currentSymCandles.length)
-        }
-        currentSymCandles = newCandles.concat(currentSymCandles)
+      if (event.name === 'study_update') {
+        let newData: any[] = event.params[1]['sds_1']['s']
+        if (newData.length > batchSize) newData = newData.slice(0, -currentIndicators.length)
+        currentIndicators = newData.concat(currentIndicators)
         return
       }
 
       if (['series_completed', 'symbol_error'].includes(event.name)) {
-        const loadedCount = currentSymCandles.length
-        if (loadedCount > 0 && loadedCount % batchSize === 0 && (!amount || loadedCount < amount)) {
-          connection.send('request_more_data', [chartSession, 'sds_1', batchSize])
+        if (amount) currentIndicators = currentIndicators.slice(0, amount)
+        allIndicators.push(currentIndicators)
+
+        if (idx + 1 < symbols.length) {
+          idx++; symbol = symbols[idx]; currentIndicators = []
+          connection.send('resolve_symbol', [chartSession, `sds_sym_${idx}`, '=' + JSON.stringify({ symbol, adjustment: 'splits' })])
+          connection.send('modify_series', [chartSession, 'sds_1', `s${idx}`, `sds_sym_${idx}`, timeframe.toString(), ''])
           return
         }
 
-        if (amount) currentSymCandles = currentSymCandles.slice(0, amount)
-
-        const candles = currentSymCandles.map(c => ({
-          timestamp: c.v[0],
-          open: c.v[1],
-          high: c.v[2],
-          low: c.v[3],
-          close: c.v[4],
-          volume: c.v[5]
-        }))
-        allCandles.push(candles)
-
-        if (symbols.length - 1 > currentSymIndex) {
-          currentSymCandles = []
-          currentSymIndex += 1
-          symbol = symbols[currentSymIndex]
-          connection.send('resolve_symbol', [
-            chartSession,
-            `sds_sym_${currentSymIndex}`,
-            '=' + JSON.stringify({ symbol, adjustment: 'splits' })
-          ])
-
-          connection.send('modify_series', [
-            chartSession,
-            'sds_1',
-            `s${currentSymIndex}`,
-            `sds_sym_${currentSymIndex}`,
-            timeframe.toString(),
-            ''
-          ])
-          return
-        }
-
-        unsubscribe()
-        resolve({ candles: allCandles, chartSession })
+        unsubscribe(); resolve(allIndicators)
       }
     })
 
     connection.send('chart_create_session', [chartSession, ''])
-    connection.send('resolve_symbol', [
-      chartSession,
-      `sds_sym_0`,
-      '=' + JSON.stringify({ symbol, adjustment: 'splits' })
-    ])
-    connection.send('create_series', [
-      chartSession, 'sds_1', 's0', 'sds_sym_0', timeframe.toString(), batchSize, ''
-    ])
+    connection.send('resolve_symbol', [chartSession, `sds_sym_0`, '=' + JSON.stringify({ symbol, adjustment: 'splits' })])
+    connection.send('create_series', [chartSession, 'sds_1', 's0', 'sds_sym_0', timeframe.toString(), batchSize, ''])
   })
 }

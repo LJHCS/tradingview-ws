@@ -1,26 +1,26 @@
-declare type Subscriber = (event: TradingviewEvent) => void;
-declare type Unsubscriber = () => void;
-export interface Candle {
-    timestamp: number;
-    high: number;
-    low: number;
-    open: number;
-    close: number;
-    volume: number;
+export declare type Subscriber = (event: TradingviewEvent) => void;
+export declare type Unsubscriber = () => void;
+export declare type TradingviewTimeframe = number | '1D' | '1W' | '1M' | '12M';
+export interface TradingviewEvent {
+    name: string;
+    params: any[];
 }
-interface TradingviewConnection {
+export interface TradingviewConnection {
     subscribe: (handler: Subscriber) => Unsubscriber;
     send: (name: string, params: any[]) => void;
     close: () => Promise<void>;
 }
+export interface Candle {
+    timestamp: number;
+    open: number;
+    high: number;
+    low: number;
+    close: number;
+    volume: number;
+}
 interface ConnectionOptions {
     sessionId?: string;
 }
-interface TradingviewEvent {
-    name: string;
-    params: any[];
-}
-declare type TradingviewTimeframe = number | '1D' | '1W' | '1M' | '12M';
 export declare function connect(options?: ConnectionOptions): Promise<TradingviewConnection>;
 interface GetCandlesParams {
     connection: TradingviewConnection;
@@ -28,16 +28,7 @@ interface GetCandlesParams {
     amount?: number;
     timeframe?: TradingviewTimeframe;
 }
-/**
- * 기존 함수 - candles만 반환
- */
 export declare function getCandles({ connection, symbols, amount, timeframe }: GetCandlesParams): Promise<Candle[][]>;
-/**
- * 새 함수 - candles + chartSession 반환
- */
-export declare function getCandlesWithSession({ connection, symbols, amount, timeframe }: GetCandlesParams): Promise<{
-    candles: Candle[][];
-    chartSession: string;
-}>;
+export declare function getIndicator({ connection, symbols, amount, timeframe }: GetCandlesParams): Promise<any[][]>;
 export {};
 //# sourceMappingURL=index.d.ts.map

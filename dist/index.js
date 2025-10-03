@@ -12,83 +12,62 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.getCandlesWithSession = exports.getCandles = exports.connect = void 0;
+exports.getIndicator = exports.getCandles = exports.connect = void 0;
 const axios_1 = __importDefault(require("axios"));
 const ws_1 = __importDefault(require("ws"));
 const randomstring_1 = __importDefault(require("randomstring"));
-const MAX_BATCH_SIZE = 5000; // found experimentally
+const MAX_BATCH_SIZE = 5000; // 경험적으로 찾은 최대 배치
+// --- 메시지 파싱 ---
 function parseMessage(message) {
-    if (message.length === 0)
+    if (!message)
         return [];
     const events = message.toString().split(/~m~\d+~m~/).slice(1);
     return events.map(event => {
-        if (event.substring(0, 3) === "~h~") {
+        if (event.substring(0, 3) === "~h~")
             return { type: 'ping', data: `~m~${event.length}~m~${event}` };
-        }
         const parsed = JSON.parse(event);
-        if (parsed['session_id']) {
+        if (parsed['session_id'])
             return { type: 'session', data: parsed };
-        }
         return { type: 'event', data: parsed };
     });
 }
+// --- 서버 연결 ---
 function connect(options = {}) {
     return __awaiter(this, void 0, void 0, function* () {
         let token = 'unauthorized_user_token';
         if (options.sessionId) {
-            const resp = yield (0, axios_1.default)({
-                method: 'get',
-                url: 'https://www.tradingview.com/disclaimer/',
+            const resp = yield axios_1.default.get('https://www.tradingview.com/disclaimer/', {
                 headers: { "Cookie": `sessionid=${options.sessionId}` }
             });
             token = resp.data.match(/"auth_token":"(.+?)"/)[1];
         }
-        const connection = new ws_1.default("wss://prodata.tradingview.com/socket.io/websocket", {
-            origin: "https://prodata.tradingview.com"
-        });
+        const ws = new ws_1.default("wss://prodata.tradingview.com/socket.io/websocket", { origin: "https://prodata.tradingview.com" });
         const subscribers = new Set();
-        function subscribe(handler) {
+        const subscribe = (handler) => {
             subscribers.add(handler);
-            return () => {
-                subscribers.delete(handler);
-            };
-        }
-        function send(name, params) {
+            return () => subscribers.delete(handler);
+        };
+        const send = (name, params) => {
             const data = JSON.stringify({ m: name, p: params });
-            const message = "~m~" + data.length + "~m~" + data;
-            connection.send(message);
-        }
-        function close() {
-            return __awaiter(this, void 0, void 0, function* () {
-                return new Promise((resolve, reject) => {
-                    connection.on('close', resolve);
-                    connection.on('error', reject);
-                    connection.close();
-                });
-            });
-        }
+            ws.send("~m~" + data.length + "~m~" + data);
+        };
+        const close = () => __awaiter(this, void 0, void 0, function* () { return new Promise((res, rej) => { ws.on('close', res); ws.on('error', rej); ws.close(); }); });
         return new Promise((resolve, reject) => {
-            connection.on('error', error => reject(error));
-            connection.on('message', message => {
+            ws.on('error', reject);
+            ws.on('message', message => {
                 const payloads = parseMessage(message.toString());
                 for (const payload of payloads) {
                     switch (payload.type) {
                         case 'ping':
-                            connection.send(payload.data);
+                            ws.send(payload.data);
                             break;
                         case 'session':
                             send('set_auth_token', [token]);
                             resolve({ subscribe, send, close });
                             break;
                         case 'event':
-                            const event = {
-                                name: payload.data.m,
-                                params: payload.data.p
-                            };
-                            subscribers.forEach(handler => handler(event));
+                            subscribers.forEach(h => h({ name: payload.data.m, params: payload.data.p }));
                             break;
-                        default:
-                            throw new Error(`unknown payload: ${payload}`);
                     }
                 }
             });
@@ -96,63 +75,36 @@ function connect(options = {}) {
     });
 }
 exports.connect = connect;
-/**
- * 기존 함수 - candles만 반환
- */
 function getCandles({ connection, symbols, amount, timeframe = 60 }) {
     return __awaiter(this, void 0, void 0, function* () {
-        if (symbols.length === 0)
+        if (!symbols.length)
             return [];
         const chartSession = "cs_" + randomstring_1.default.generate(12);
         const batchSize = amount && amount < MAX_BATCH_SIZE ? amount : MAX_BATCH_SIZE;
         return new Promise(resolve => {
             const allCandles = [];
-            let currentSymIndex = 0;
-            let symbol = symbols[currentSymIndex];
-            let currentSymCandles = [];
+            let idx = 0, symbol = symbols[idx], currentCandles = [];
             const unsubscribe = connection.subscribe(event => {
                 if (event.name === 'timescale_update') {
                     let newCandles = event.params[1]['sds_1']['s'];
-                    if (newCandles.length > batchSize) {
-                        newCandles = newCandles.slice(0, -currentSymCandles.length);
-                    }
-                    currentSymCandles = newCandles.concat(currentSymCandles);
+                    if (newCandles.length > batchSize)
+                        newCandles = newCandles.slice(0, -currentCandles.length);
+                    currentCandles = newCandles.concat(currentCandles);
                     return;
                 }
                 if (['series_completed', 'symbol_error'].includes(event.name)) {
-                    const loadedCount = currentSymCandles.length;
-                    if (loadedCount > 0 && loadedCount % batchSize === 0 && (!amount || loadedCount < amount)) {
-                        connection.send('request_more_data', [chartSession, 'sds_1', batchSize]);
-                        return;
-                    }
                     if (amount)
-                        currentSymCandles = currentSymCandles.slice(0, amount);
-                    const candles = currentSymCandles.map(c => ({
-                        timestamp: c.v[0],
-                        open: c.v[1],
-                        high: c.v[2],
-                        low: c.v[3],
-                        close: c.v[4],
-                        volume: c.v[5]
+                        currentCandles = currentCandles.slice(0, amount);
+                    const candles = currentCandles.map(c => ({
+                        timestamp: c.v[0], open: c.v[1], high: c.v[2], low: c.v[3], close: c.v[4], volume: c.v[5]
                     }));
                     allCandles.push(candles);
-                    if (symbols.length - 1 > currentSymIndex) {
-                        currentSymCandles = [];
-                        currentSymIndex += 1;
-                        symbol = symbols[currentSymIndex];
-                        connection.send('resolve_symbol', [
-                            chartSession,
-                            `sds_sym_${currentSymIndex}`,
-                            '=' + JSON.stringify({ symbol, adjustment: 'splits' })
-                        ]);
-                        connection.send('modify_series', [
-                            chartSession,
-                            'sds_1',
-                            `s${currentSymIndex}`,
-                            `sds_sym_${currentSymIndex}`,
-                            timeframe.toString(),
-                            ''
-                        ]);
+                    if (idx + 1 < symbols.length) {
+                        idx++;
+                        symbol = symbols[idx];
+                        currentCandles = [];
+                        connection.send('resolve_symbol', [chartSession, `sds_sym_${idx}`, '=' + JSON.stringify({ symbol, adjustment: 'splits' })]);
+                        connection.send('modify_series', [chartSession, 'sds_1', `s${idx}`, `sds_sym_${idx}`, timeframe.toString(), '']);
                         return;
                     }
                     unsubscribe();
@@ -160,92 +112,51 @@ function getCandles({ connection, symbols, amount, timeframe = 60 }) {
                 }
             });
             connection.send('chart_create_session', [chartSession, '']);
-            connection.send('resolve_symbol', [
-                chartSession,
-                `sds_sym_0`,
-                '=' + JSON.stringify({ symbol, adjustment: 'splits' })
-            ]);
-            connection.send('create_series', [
-                chartSession, 'sds_1', 's0', 'sds_sym_0', timeframe.toString(), batchSize, ''
-            ]);
+            connection.send('resolve_symbol', [chartSession, `sds_sym_0`, '=' + JSON.stringify({ symbol, adjustment: 'splits' })]);
+            connection.send('create_series', [chartSession, 'sds_1', 's0', 'sds_sym_0', timeframe.toString(), batchSize, '']);
         });
     });
 }
 exports.getCandles = getCandles;
-/**
- * 새 함수 - candles + chartSession 반환
- */
-function getCandlesWithSession({ connection, symbols, amount, timeframe = 60 }) {
+// --- 보조지표 가져오기 ---
+function getIndicator({ connection, symbols, amount, timeframe = 60 }) {
     return __awaiter(this, void 0, void 0, function* () {
-        if (symbols.length === 0)
-            return { candles: [], chartSession: "" };
+        if (!symbols.length)
+            return [];
         const chartSession = "cs_" + randomstring_1.default.generate(12);
         const batchSize = amount && amount < MAX_BATCH_SIZE ? amount : MAX_BATCH_SIZE;
         return new Promise(resolve => {
-            const allCandles = [];
-            let currentSymIndex = 0;
-            let symbol = symbols[currentSymIndex];
-            let currentSymCandles = [];
+            const allIndicators = [];
+            let idx = 0, symbol = symbols[idx], currentIndicators = [];
             const unsubscribe = connection.subscribe(event => {
-                if (event.name === 'timescale_update') {
-                    let newCandles = event.params[1]['sds_1']['s'];
-                    if (newCandles.length > batchSize) {
-                        newCandles = newCandles.slice(0, -currentSymCandles.length);
-                    }
-                    currentSymCandles = newCandles.concat(currentSymCandles);
+                if (event.name === 'study_update') {
+                    let newData = event.params[1]['sds_1']['s'];
+                    if (newData.length > batchSize)
+                        newData = newData.slice(0, -currentIndicators.length);
+                    currentIndicators = newData.concat(currentIndicators);
                     return;
                 }
                 if (['series_completed', 'symbol_error'].includes(event.name)) {
-                    const loadedCount = currentSymCandles.length;
-                    if (loadedCount > 0 && loadedCount % batchSize === 0 && (!amount || loadedCount < amount)) {
-                        connection.send('request_more_data', [chartSession, 'sds_1', batchSize]);
-                        return;
-                    }
                     if (amount)
-                        currentSymCandles = currentSymCandles.slice(0, amount);
-                    const candles = currentSymCandles.map(c => ({
-                        timestamp: c.v[0],
-                        open: c.v[1],
-                        high: c.v[2],
-                        low: c.v[3],
-                        close: c.v[4],
-                        volume: c.v[5]
-                    }));
-                    allCandles.push(candles);
-                    if (symbols.length - 1 > currentSymIndex) {
-                        currentSymCandles = [];
-                        currentSymIndex += 1;
-                        symbol = symbols[currentSymIndex];
-                        connection.send('resolve_symbol', [
-                            chartSession,
-                            `sds_sym_${currentSymIndex}`,
-                            '=' + JSON.stringify({ symbol, adjustment: 'splits' })
-                        ]);
-                        connection.send('modify_series', [
-                            chartSession,
-                            'sds_1',
-                            `s${currentSymIndex}`,
-                            `sds_sym_${currentSymIndex}`,
-                            timeframe.toString(),
-                            ''
-                        ]);
+                        currentIndicators = currentIndicators.slice(0, amount);
+                    allIndicators.push(currentIndicators);
+                    if (idx + 1 < symbols.length) {
+                        idx++;
+                        symbol = symbols[idx];
+                        currentIndicators = [];
+                        connection.send('resolve_symbol', [chartSession, `sds_sym_${idx}`, '=' + JSON.stringify({ symbol, adjustment: 'splits' })]);
+                        connection.send('modify_series', [chartSession, 'sds_1', `s${idx}`, `sds_sym_${idx}`, timeframe.toString(), '']);
                         return;
                     }
                     unsubscribe();
-                    resolve({ candles: allCandles, chartSession });
+                    resolve(allIndicators);
                 }
             });
             connection.send('chart_create_session', [chartSession, '']);
-            connection.send('resolve_symbol', [
-                chartSession,
-                `sds_sym_0`,
-                '=' + JSON.stringify({ symbol, adjustment: 'splits' })
-            ]);
-            connection.send('create_series', [
-                chartSession, 'sds_1', 's0', 'sds_sym_0', timeframe.toString(), batchSize, ''
-            ]);
+            connection.send('resolve_symbol', [chartSession, `sds_sym_0`, '=' + JSON.stringify({ symbol, adjustment: 'splits' })]);
+            connection.send('create_series', [chartSession, 'sds_1', 's0', 'sds_sym_0', timeframe.toString(), batchSize, '']);
         });
     });
 }
-exports.getCandlesWithSession = getCandlesWithSession;
+exports.getIndicator = getIndicator;
 //# sourceMappingURL=index.js.map
